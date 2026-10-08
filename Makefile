@@ -4,6 +4,7 @@
 .PHONY: run
 .PHONY: run-debug
 .PHONY: dogfood
+.PHONY: build
 .PHONY: install
 .PHONY: check
 .PHONY: lint
@@ -21,6 +22,7 @@
 .PHONY: test-release
 
 PROTOS_IMAGE ?= trufflesecurity/protos:1.22
+BUILD_DIR ?= build
 
 help: ## Display this help message
 	@echo "Usage: make [target]"
@@ -36,6 +38,10 @@ run-debug: ## Run a git scan on this repository with enhanced logging (level 2)
 	CGO_ENABLED=0 go run . git file://. --json --log-level=2
 
 dogfood: run-debug
+
+build: ## Build the binary into BUILD_DIR (default: build)
+	mkdir -p "$(BUILD_DIR)"
+	CGO_ENABLED=0 go build -o "$(BUILD_DIR)/trufflehog" .
 
 install: ## Run go install
 	CGO_ENABLED=0 go install .
