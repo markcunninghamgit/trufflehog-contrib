@@ -34,6 +34,8 @@ func (e *Engine) ScanGitHub(ctx context.Context, c sources.GithubConfig) (source
 		IgnoreGists:                c.IgnoreGists,
 		ExcludeArchived:            c.ExcludeArchived,
 		PrintLegacyJson:            c.PrintLegacyJSON,
+		PersistentClones:           c.PersistentClones,
+		SkipScanIfUnchanged:        c.SkipScanIfUnchanged,
 	}
 
 	if len(c.Token) > 0 {
@@ -66,5 +68,6 @@ func (e *Engine) ScanGitHub(ctx context.Context, c sources.GithubConfig) (source
 		return sources.JobProgressRef{}, err
 	}
 	githubSource.WithScanOptions(scanOptions)
+	e.addPostScanHook(githubSource.CommitScannedDigests)
 	return e.sourceManager.EnumerateAndScan(ctx, sourceName, githubSource)
 }

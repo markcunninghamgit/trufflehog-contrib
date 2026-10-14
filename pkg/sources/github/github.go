@@ -75,6 +75,11 @@ type Source struct {
 	appInstallations       []*github.Installation
 	appInstallationsLoaded bool
 
+	// pendingDigests maps clone paths to refs digests of repos that were scanned successfully, until
+	// CommitScannedDigests records them.
+	pendingDigestsMu sync.Mutex
+	pendingDigests   map[string]string
+
 	includePRComments     bool
 	includeIssueComments  bool
 	ignoreGists           bool
@@ -1409,9 +1414,24 @@ func (s *Source) cloneAndScanRepo(ctx context.Context, repoURL string, repoInfo 
 	}
 	// remove the path only if it was created as a temporary path, or if it is a clone path and --no-cleanup is not set.
 	// if legacy JSON is enabled, don't remove the directory because we need it for outputting legacy JSON.
-	if !s.conn.GetPrintLegacyJson() {
+	if !s.conn.GetPrintLegacyJson() && !s.conn.GetPersistentClones() {
 		if strings.HasPrefix(path, filepath.Join(os.TempDir(), "trufflehog")) || (!s.conn.NoCleanup && s.conn.GetClonePath() != "") {
 			defer func() { _ = os.RemoveAll(path) }()
+		}
+	}
+
+	// A range-limited scan must not record or trust a digest meant for a full scan.
+	var refsDigest string
+	if s.conn.GetPersistentClones() && s.conn.GetSkipScanIfUnchanged() && s.conn.Base == "" && s.conn.Head == "" {
+		digest, err := git.RefsDigest(ctx, path)
+		switch {
+		case err != nil:
+			ctx.Logger().Error(err, "could not compute refs digest; scanning repo")
+		case digest == git.ScannedRefsDigest(ctx, path):
+			ctx.Logger().V(2).Info("skipping scan, refs unchanged since last successful scan", "repo", repoURL)
+			return duration, nil
+		default:
+			refsDigest = digest
 		}
 	}
 
@@ -1419,11 +1439,53 @@ func (s *Source) cloneAndScanRepo(ctx context.Context, repoURL string, repoInfo 
 	s.setScanOptions(s.conn.Base, s.conn.Head)
 
 	start := time.Now()
-	if err = s.git.ScanRepo(ctx, repo, path, s.scanOptions, reporter); err != nil {
+	tracker := &errTrackingReporter{ChunkReporter: reporter}
+	if err = s.git.ScanRepo(ctx, repo, path, s.scanOptions, tracker); err != nil {
 		return duration, fmt.Errorf("error scanning repo %s: %w", repoURL, err)
 	}
 	duration = time.Since(start)
+
+	// Chunks are still queued for processing here, so the digest is only recorded once the engine finishes.
+	if refsDigest != "" && !tracker.failed.Load() {
+		s.queueScannedDigest(path, refsDigest)
+	}
 	return duration, nil
+}
+
+// errTrackingReporter remembers whether any chunk error was reported through it.
+type errTrackingReporter struct {
+	sources.ChunkReporter
+	failed atomic.Bool
+}
+
+func (r *errTrackingReporter) ChunkErr(ctx context.Context, err error) error {
+	r.failed.Store(true)
+	return r.ChunkReporter.ChunkErr(ctx, err)
+}
+
+func (s *Source) queueScannedDigest(path, digest string) {
+	s.pendingDigestsMu.Lock()
+	defer s.pendingDigestsMu.Unlock()
+	if s.pendingDigests == nil {
+		s.pendingDigests = make(map[string]string)
+	}
+	s.pendingDigests[path] = digest
+}
+
+// CommitScannedDigests records the refs digests of repos scanned successfully, which lets a later run skip them when
+// --skip-scan-if-unchanged is set. It must only be called after the engine has finished processing every chunk, since
+// a digest recorded earlier could cause a repo to be skipped although its chunks were never processed.
+func (s *Source) CommitScannedDigests(ctx context.Context) {
+	s.pendingDigestsMu.Lock()
+	pending := s.pendingDigests
+	s.pendingDigests = nil
+	s.pendingDigestsMu.Unlock()
+
+	for path, digest := range pending {
+		if err := git.SetScannedRefsDigest(ctx, path, digest); err != nil {
+			ctx.Logger().Error(err, "could not record scanned refs digest", "path", path)
+		}
+	}
 }
 
 var (
@@ -2464,7 +2526,7 @@ func (s *Source) scanWikiTarget(ctx context.Context, wikiURL string, meta *sourc
 	if err != nil {
 		return fmt.Errorf("could not clone wiki for targeted scan: %w", err)
 	}
-	if !s.conn.GetPrintLegacyJson() {
+	if !s.conn.GetPrintLegacyJson() && !s.conn.GetPersistentClones() {
 		if strings.HasPrefix(path, filepath.Join(os.TempDir(), "trufflehog")) || (!s.conn.NoCleanup && s.conn.GetClonePath() != "") {
 			defer func() { _ = os.RemoveAll(path) }()
 		}
