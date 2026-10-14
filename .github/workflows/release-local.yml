@@ -1,0 +1,79 @@
+name: Local Release
+
+on:
+  push:
+    branches:
+      - my-build
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="local-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          EXT=""; [ "$GOOS" = "windows" ] && EXT=".exe"
+          NAME="trufflehog_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/$NAME"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/trufflesecurity/trufflehog/v3/pkg/version.BuildVersion=${VERSION}" \
+            -o "dist/$NAME/trufflehog${EXT}" .
+          cp LICENSE README.md "dist/$NAME/"
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip -qr "${NAME}.zip" "$NAME"
+          else
+            tar -czf "${NAME}.tar.gz" "$NAME"
+          fi
+          rm -rf "$NAME"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="local-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Build of ${GITHUB_SHA} from ${GITHUB_REF_NAME}"
