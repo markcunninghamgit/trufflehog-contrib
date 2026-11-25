@@ -33,14 +33,14 @@ func TestSource_Token(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to access secret: %v", err))
 	}
 
-	githubPrivateKeyB64New := secret.MustGetField("GITHUB_PRIVATE_KEY_NEW")
+	githubPrivateKeyB64New := secret.MustGetField(t, "GITHUB_PRIVATE_KEY_NEW")
 	githubPrivateKeyBytesNew, err := base64.StdEncoding.DecodeString(githubPrivateKeyB64New)
 	if err != nil {
 		t.Fatal(err)
 	}
 	githubPrivateKeyNew := string(githubPrivateKeyBytesNew)
-	githubInstallationIDNew := secret.MustGetField("GITHUB_INSTALLATION_ID_NEW")
-	githubAppIDNew := secret.MustGetField("GITHUB_APP_ID_NEW")
+	githubInstallationIDNew := secret.MustGetField(t, "GITHUB_INSTALLATION_ID_NEW")
+	githubAppIDNew := secret.MustGetField(t, "GITHUB_APP_ID_NEW")
 
 	src := &sourcespb.GitHub{
 		Endpoint: "https://api.github.com",
@@ -81,14 +81,14 @@ func TestSource_ExcludeArchived(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to access secret: %v", err))
 	}
 
-	githubPrivateKeyB64New := secret.MustGetField("GITHUB_PRIVATE_KEY_NEW")
+	githubPrivateKeyB64New := secret.MustGetField(t, "GITHUB_PRIVATE_KEY_NEW")
 	githubPrivateKeyBytesNew, err := base64.StdEncoding.DecodeString(githubPrivateKeyB64New)
 	if err != nil {
 		t.Fatal(err)
 	}
 	githubPrivateKeyNew := string(githubPrivateKeyBytesNew)
-	githubInstallationIDNew := secret.MustGetField("GITHUB_INSTALLATION_ID_NEW")
-	githubAppIDNew := secret.MustGetField("GITHUB_APP_ID_NEW")
+	githubInstallationIDNew := secret.MustGetField(t, "GITHUB_INSTALLATION_ID_NEW")
+	githubAppIDNew := secret.MustGetField(t, "GITHUB_APP_ID_NEW")
 
 	srcWithExclude := &sourcespb.GitHub{
 		Endpoint: "https://api.github.com",
@@ -162,7 +162,7 @@ func TestSource_ScanComments(t *testing.T) {
 	}
 
 	// For the personal access token test
-	githubToken := secret.MustGetField("GITHUB_TOKEN")
+	githubToken := secret.MustGetField(t, "GITHUB_TOKEN")
 
 	const totalPRChunks = 3
 	const totalIssueChunks = 2
@@ -305,7 +305,7 @@ func TestSource_ScanChunks(t *testing.T) {
 	}
 
 	// For the personal access token test.
-	githubToken := secret.MustGetField("GITHUB_TOKEN")
+	githubToken := secret.MustGetField(t, "GITHUB_TOKEN")
 
 	type init struct {
 		name       string
@@ -376,17 +376,17 @@ func TestSource_Scan(t *testing.T) {
 	}
 
 	// For the personal access token test
-	githubToken := secret.MustGetField("GITHUB_TOKEN")
+	githubToken := secret.MustGetField(t, "GITHUB_TOKEN")
 
 	// For the  NEW github app test (+Member enum)
-	githubPrivateKeyB64New := secret.MustGetField("GITHUB_PRIVATE_KEY_NEW")
+	githubPrivateKeyB64New := secret.MustGetField(t, "GITHUB_PRIVATE_KEY_NEW")
 	githubPrivateKeyBytesNew, err := base64.StdEncoding.DecodeString(githubPrivateKeyB64New)
 	if err != nil {
 		t.Fatal(err)
 	}
 	githubPrivateKeyNew := string(githubPrivateKeyBytesNew)
-	githubInstallationIDNew := secret.MustGetField("GITHUB_INSTALLATION_ID_NEW")
-	githubAppIDNew := secret.MustGetField("GITHUB_APP_ID_NEW")
+	githubInstallationIDNew := secret.MustGetField(t, "GITHUB_INSTALLATION_ID_NEW")
+	githubAppIDNew := secret.MustGetField(t, "GITHUB_APP_ID_NEW")
 
 	type init struct {
 		name       string
@@ -788,7 +788,7 @@ func TestSource_Chunks_TargetedScan(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to access secret: %v", err))
 	}
 
-	githubToken := secret.MustGetField("GITHUB_TOKEN")
+	githubToken := secret.MustGetField(t, "GITHUB_TOKEN")
 
 	type init struct {
 		name          string
@@ -973,10 +973,10 @@ func TestSource_Validate(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to access secret: %v", err))
 	}
 
-	githubToken := secret.MustGetField("GITHUB_TOKEN")
-	githubPrivateKeyB64New := secret.MustGetField("GITHUB_PRIVATE_KEY_NEW")
-	githubInstallationIDNew := secret.MustGetField("GITHUB_INSTALLATION_ID_NEW")
-	githubAppIDNew := secret.MustGetField("GITHUB_APP_ID_NEW")
+	githubToken := secret.MustGetField(t, "GITHUB_TOKEN")
+	githubPrivateKeyB64New := secret.MustGetField(t, "GITHUB_PRIVATE_KEY_NEW")
+	githubInstallationIDNew := secret.MustGetField(t, "GITHUB_INSTALLATION_ID_NEW")
+	githubAppIDNew := secret.MustGetField(t, "GITHUB_APP_ID_NEW")
 
 	githubPrivateKeyBytesNew, err := base64.StdEncoding.DecodeString(githubPrivateKeyB64New)
 	if err != nil {
@@ -1051,15 +1051,22 @@ func TestSource_Validate(t *testing.T) {
 
 func TestSource_ScanCommentsWithGraphql(t *testing.T) {
 	feature.UseGithubGraphQLAPI.Store(true)
+	t.Cleanup(func() { feature.UseGithubGraphQLAPI.Store(false) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
+	secret, err := common.GetTestSecret(ctx)
+	if err != nil {
+		t.Fatal(fmt.Errorf("failed to access secret: %v", err))
+	}
+
+	// GitHub's GraphQL API does not allow unauthenticated requests
 	source := &sourcespb.GitHub{
 		Repositories:               []string{"https://github.com/trufflesecurity/driftwood.git"},
 		IncludeIssueComments:       true,
 		IncludePullRequestComments: true,
-		Credential:                 &sourcespb.GitHub_Unauthenticated{},
+		Credential:                 &sourcespb.GitHub_Token{Token: secret.MustGetField(t, "GITHUB_TOKEN")},
 	}
 
 	wantChunk := sources.Chunk{
@@ -1103,8 +1110,8 @@ func TestSource_ScanCommentsWithGraphql(t *testing.T) {
 		githubCommentCheckFunc(gotChunk, &wantChunk, i, t, "test-source")
 	}
 
-	// Confirm all comments were processed.
-	assert.Equal(t, i, 5)
+	// 7 issues, 12 issue comments, 8 pull requests, 6 pull request comments
+	assert.Equal(t, 33, i)
 }
 
 type countChunkReporter struct {

@@ -59,6 +59,8 @@ var (
 	KongKonnectDetectorEnabled               atomic.Bool
 	SonarQubeDetectorEnabled                 atomic.Bool
 	InfisicalDetectorEnabled                 atomic.Bool
+	ServalDetectorEnabled                    atomic.Bool
+	BasetenDetectorEnabled                   atomic.Bool
 )
 
 type AtomicString struct {
