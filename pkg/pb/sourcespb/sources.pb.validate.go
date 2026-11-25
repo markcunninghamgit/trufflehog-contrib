@@ -2637,6 +2637,10 @@ func (m *GitHub) validate(all bool) error {
 
 	// no validation rules for ExcludeArchived
 
+	// no validation rules for PersistentClones
+
+	// no validation rules for SkipScanIfUnchanged
+
 	switch v := m.Credential.(type) {
 	case *GitHub_GithubApp:
 		if v == nil {

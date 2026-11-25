@@ -149,6 +149,25 @@ func (c *appConnector) Clone(ctx context.Context, repoURL string, args ...string
 	return git.CloneRepoUsingToken(ctx, token, repoURL, "", "x-access-token", true, args...)
 }
 
+func (c *appConnector) ClonePersistent(ctx context.Context, repoURL, clonePath string) (string, *gogit.Repository, error) {
+	installID, _ := c.installationIDForRepo(repoURL)
+	if installID == 0 {
+		return "", nil, fmt.Errorf("no GitHub App installation resolved for repo %q", repoURL)
+	}
+
+	cs, err := c.clientsForInstallation(ctx, installID)
+	if err != nil {
+		return "", nil, fmt.Errorf("cannot fetch installation clients for installation %d: %w", installID, err)
+	}
+
+	token, err := cs.AccessToken(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return git.CloneOrFetchRepoUsingToken(ctx, token, repoURL, clonePath, "x-access-token")
+}
+
 // grantsForRepo returns what the installation that owns repoURL grants, for
 // the permissions the comment scan needs. Installation permissions apply to
 // every repo the installation can see, so repos on one installation share

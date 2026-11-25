@@ -259,6 +259,22 @@ trufflehog github --org my-org --token ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 
 
 With `--clone-path` set, each repository still gets its own fresh subdirectory created inside it (named `trufflehog-<repo-name>-...`), TruffleHog never clones into `--clone-path` itself. Without `--no-cleanup`, that subdirectory is deleted after the repository is scanned, but `--clone-path` itself and anything else already in it is left alone.
 
+### Persistent Clones (resuming and re-running scans)
+
+`--persistent-clones` (requires `--clone-path`, incompatible with `--auth-in-url`) keeps every clone in a stable directory and, on later runs, fetches new data into the existing clone instead of cloning again. Interrupted org scans can simply be run again: finished clones are fetched, missing ones are cloned.
+
+```bash
+trufflehog github --org my-org --token ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --clone-path /path/to/clones --persistent-clones
+```
+
+Clones live at `<clone-path>/<hash>-<host>/<hash>-<owner>/<hash>-<repo>`. The hashes identify the directories, the names are for humans. Wikis get their own `<repo>.wiki` directory next to the repository.
+
+- Fetching never prunes or deletes anything. Before each fetch, every current ref tip is kept as `refs/trufflehog/preserved/<sha>`, so commits stay reachable even when a branch or tag is force-pushed or deleted upstream (those commits are scanned too). These refs are never removed, so disk usage only grows.
+- Credentials are sent as an HTTP header scoped to the repository's URL and are not written to the clone's git config. Before fetching, the clone's `origin` must still be that repository (same scheme, host and path); otherwise the fetch is refused and nothing is sent.
+- A repository gone upstream is left on disk untouched.
+- A clone interrupted by a hard kill may leave a `<repo>.partial` directory; it is replaced on the next run.
+- `--skip-scan-if-unchanged` skips only the secret scan of a repository whose refs are identical to those at its last successful scan (recorded in the clone's own git config as `trufflehog.scannedRefsDigest`). The fetch always runs. The digest is recorded only after the whole scan has finished and every chunk has been processed, and only for repositories scanned without errors; an interrupted run records nothing, so its repositories are scanned again next time. Refs such as pull request refs count, so busy repositories rarely qualify.
+
 ## How Scanning Works
 
 ### Scanning Process
