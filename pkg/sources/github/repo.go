@@ -276,6 +276,14 @@ func (s *Source) processRepos(ctx context.Context, target string, reporter sourc
 		if err != nil {
 			return err
 		}
+		if pageReporter, ok := reporter.(sources.EnumerationPageReporter); ok {
+			pageReporter.Page(ctx, sources.EnumerationPage{
+				Number:       opts.Page,
+				RequestKind:  "github_repositories",
+				ItemsSeen:    len(someRepos),
+				Continuation: res.NextPage != 0,
+			})
+		}
 
 		// one line per page, with how many API calls we have left before the rate limit
 		ctx.Logger().V(4).Info("Listed repos", "page", opts.Page, "last_page", res.LastPage, "rate_remaining", res.Rate.Remaining)
