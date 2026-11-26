@@ -37,6 +37,7 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/sourcespb"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/verificationcache"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/workqueue"
 )
 
 var detectionTimeout = detectors.DefaultResponseTimeout
@@ -55,6 +56,11 @@ type Metrics struct {
 	VerifiedSecretsFound   uint64
 	UnverifiedSecretsFound uint64
 	AvgDetectorTime        map[string]time.Duration
+
+	// AbandonedDecodes counts chunks whose decoded variants were dropped under
+	// pressure or budget; the original chunk was still scanned.
+	AbandonedDecodes     uint64
+	AbandonedDecodeBytes uint64
 
 	scanStartTime time.Time
 	ScanDuration  time.Duration
@@ -183,6 +189,10 @@ type Config struct {
 	// Default: 5.
 	MaxDecodeDepth int
 
+	// MaxDecodedBytesPerChunk abandons a chunk's decoded variants once they would
+	// exceed this many bytes. The original chunk is still scanned. 0 disables it.
+	MaxDecodedBytesPerChunk int64
+
 	// Max size of the deduplication LRU cache
 	DedupeCacheSize int
 }
@@ -230,6 +240,10 @@ type Engine struct {
 	verificationOverlapWg         sync.WaitGroup
 	wgDetectorWorkers             sync.WaitGroup
 	WgNotifier                    sync.WaitGroup
+	scannerQueue                  *workqueue.Queue[*sources.Chunk]
+	detectorQueue                 *workqueue.Queue[detectableChunk]
+	verificationQueue             *workqueue.Queue[verificationOverlapChunk]
+	notifierQueue                 *workqueue.Queue[detectors.ResultWithMetadata]
 
 	// Runtime information.
 	metrics runtimeMetrics
@@ -258,6 +272,11 @@ type Engine struct {
 
 	maxDecodeDepth int
 
+	// maxDecodedBytesPerChunk bounds the decoded variants one chunk may retain; 0 is unlimited.
+	maxDecodedBytesPerChunk int64
+	// stageWork tracks in-flight decodes so they can be shed under pressure.
+	stageWork stageWork
+
 	dedupeCacheSize int
 
 	// runtimeCollector exposes live channel/worker/scan counters to Prometheus
@@ -280,6 +299,7 @@ func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
 		filterEntropy:                       cfg.FilterEntropy,
 		printAvgDetectorTime:                cfg.PrintAvgDetectorTime,
 		retainFalsePositives:                cfg.LogFilteredUnverified,
+		maxDecodedBytesPerChunk:             cfg.MaxDecodedBytesPerChunk,
 		verificationOverlap:                 cfg.VerificationOverlap,
 		sourceManager:                       cfg.SourceManager,
 		scanEntireChunk:                     cfg.ShouldScanEntireChunk,
@@ -758,60 +778,98 @@ func (e *Engine) startWorkers(ctx context.Context) {
 
 func (e *Engine) startScannerWorkers(ctx context.Context) {
 	ctx.Logger().V(2).Info("starting scanner workers", "count", e.concurrency)
+	if queue, err := workqueue.New[*sources.Chunk](maxInt(e.concurrency, 1)); err != nil {
+		ctx.Logger().Error(err, "failed to create scanner work queue")
+	} else {
+		e.scannerQueue = queue
+	}
 	for worker := uint64(0); worker < uint64(e.concurrency); worker++ {
 		e.workersWg.Add(1)
 		go func() {
-			ctx := context.WithValue(ctx, "scanner_worker_id", common.RandomID(5))
-			defer common.Recover(ctx)
 			defer e.workersWg.Done()
-			e.scannerWorker(ctx)
+			e.runWorker(ctx, "scanner", "scanner_worker_id", e.scannerWorker)
 		}()
 	}
 }
 
 func (e *Engine) startDetectorWorkers(ctx context.Context) {
 	numWorkers := e.concurrency * e.detectorWorkerMultiplier
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	queue, err := workqueue.New[detectableChunk](numWorkers)
+	if err != nil {
+		ctx.Logger().Error(err, "failed to create detector work queue")
+		return
+	}
+	e.detectorQueue = queue
 
 	ctx.Logger().V(2).Info("starting detector workers", "count", numWorkers)
 	for worker := 0; worker < numWorkers; worker++ {
 		e.wgDetectorWorkers.Add(1)
 		go func() {
-			ctx := context.WithValue(ctx, "detector_worker_id", common.RandomID(5))
-			defer common.Recover(ctx)
 			defer e.wgDetectorWorkers.Done()
-			e.detectorWorker(ctx)
+			e.runWorker(ctx, "detector", "detector_worker_id", e.detectorWorker)
 		}()
 	}
 }
 
 func (e *Engine) startVerificationOverlapWorkers(ctx context.Context) {
 	numWorkers := e.concurrency * e.verificationOverlapWorkerMultiplier
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	queue, err := workqueue.New[verificationOverlapChunk](numWorkers)
+	if err != nil {
+		ctx.Logger().Error(err, "failed to create verification overlap work queue")
+		return
+	}
+	e.verificationQueue = queue
 
 	ctx.Logger().V(2).Info("starting verificationOverlap workers", "count", numWorkers)
 	for worker := 0; worker < numWorkers; worker++ {
 		e.verificationOverlapWg.Add(1)
 		go func() {
-			ctx := context.WithValue(ctx, "verification_overlap_worker_id", common.RandomID(5))
-			defer common.Recover(ctx)
 			defer e.verificationOverlapWg.Done()
-			e.verificationOverlapWorker(ctx)
+			e.runWorker(ctx, "verification_overlap", "verification_overlap_worker_id", e.verificationOverlapWorker)
 		}()
 	}
 }
 
 func (e *Engine) startNotifierWorkers(ctx context.Context) {
 	numWorkers := e.notificationWorkerMultiplier * e.concurrency
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	queue, err := workqueue.New[detectors.ResultWithMetadata](numWorkers)
+	if err != nil {
+		ctx.Logger().Error(err, "failed to create notifier work queue")
+		return
+	}
+	e.notifierQueue = queue
 
 	ctx.Logger().V(2).Info("starting notifier workers", "count", numWorkers)
 	for worker := 0; worker < numWorkers; worker++ {
 		e.WgNotifier.Add(1)
 		go func() {
-			ctx := context.WithValue(ctx, "notifier_worker_id", common.RandomID(5))
-			defer common.Recover(ctx)
 			defer e.WgNotifier.Done()
-			e.notifierWorker(ctx)
+			e.runWorker(ctx, "notifier", "notifier_worker_id", e.notifierWorker)
 		}()
 	}
+}
+
+func (e *Engine) runWorker(ctx context.Context, workerType, workerIDKey string, work func(context.Context)) {
+	workerID := common.RandomID(5)
+	workerCtx := context.WithValue(ctx, workerIDKey, workerID)
+	workerCtx.Logger().V(3).Info("worker started", "role", workerType+"-worker", "event", "worker_started", "worker_type", workerType, "worker_id", workerID)
+	defer func() {
+		workerCtx.Logger().V(3).Info("worker finished", "role", workerType+"-worker", "event", "worker_finished", "worker_type", workerType, "worker_id", workerID)
+	}()
+	defer common.Recover(workerCtx)
+	work(workerCtx)
 }
 
 // Finish waits for running sources to complete and workers to finish scanning
@@ -836,6 +894,7 @@ func (e *Engine) Finish(ctx context.Context) error {
 	e.metrics.ScanDuration = time.Since(e.metrics.scanStartTime)
 
 	e.unregisterRuntimeMetrics()
+	ctx.Logger().V(2).Info("engine scan finished", "role", "parent", "event", "engine_scan_finished", "source_error", err != nil, "cancelled", ctx.Err() != nil)
 
 	return err
 }
@@ -846,6 +905,33 @@ func (e *Engine) ChunksChan() <-chan *sources.Chunk {
 
 func (e *Engine) ResultsChan() chan detectors.ResultWithMetadata {
 	return e.results
+}
+
+// SetMaxConcurrentStages changes admission limits for all queue-backed
+// downstream stages without interrupting work already in flight.
+func (e *Engine) SetMaxConcurrentStages(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	if e.scannerQueue != nil {
+		_ = e.scannerQueue.SetLimit(limit)
+	}
+	if e.detectorQueue != nil {
+		_ = e.detectorQueue.SetLimit(limit * maxInt(e.detectorWorkerMultiplier, 1))
+	}
+	if e.verificationQueue != nil {
+		_ = e.verificationQueue.SetLimit(limit * maxInt(e.verificationOverlapWorkerMultiplier, 1))
+	}
+	if e.notifierQueue != nil {
+		_ = e.notifierQueue.SetLimit(limit * maxInt(e.notificationWorkerMultiplier, 1))
+	}
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 // ScanChunk injects a chunk into the output stream of chunks to be scanned.
@@ -882,23 +968,44 @@ type verificationOverlapChunk struct {
 // The returned chunks include results from every depth level -- intermediate
 // decoded forms are scanned, not just the final one, because a secret may only
 // be recognizable at a particular decoding stage.
-func iterativeDecode(chunk *sources.Chunk, allDecoders []decoders.Decoder, maxDepth int) []*decoders.DecodableChunk {
-	var results []*decoders.DecodableChunk
+//
+// Decoding is cooperative: ctx and the optional byte budget are checked before
+// every non-PLAIN decoder call. When a decode is shed or exceeds budget, every
+// decoded variant is dropped, the PLAIN pass is kept so the original chunk is
+// still scanned, and the outcome is marked abandoned so the caller can record
+// it. A budget of 0 disables the byte limit. run may be nil.
+func iterativeDecode(ctx context.Context, run *decodeRun, budget int64, chunk *sources.Chunk, allDecoders []decoders.Decoder, maxDepth int) ([]*decoders.DecodableChunk, decodeOutcome) {
+	var (
+		results []*decoders.DecodableChunk
+		outcome decodeOutcome
+	)
 
 	currentInputs := [][]byte{chunk.Data}
 	var seen [][]byte
 
+decode:
 	for depth := 0; depth < maxDepth; depth++ {
 		var nextInputs [][]byte
 
 		for _, data := range currentInputs {
 			for _, decoder := range allDecoders {
+				isPlain := decoder.Type() == detectorspb.DecoderType_PLAIN
 				// The PLAIN (UTF-8) decoder always returns non-nil and only transforms
 				// invalid UTF-8 via extractSubstrings. All other decoders already produce
 				// valid UTF-8/ASCII output, so re-running PLAIN at depth > 0 would just
 				// duplicate detector work without ever changing the data.
-				if depth > 0 && decoder.Type() == detectorspb.DecoderType_PLAIN {
+				if depth > 0 && isPlain {
 					continue
+				}
+
+				if !isPlain {
+					if stop, reason := decodeStopReason(ctx, run, budget, int64(len(data))); stop {
+						outcome.abandoned = reason != ""
+						outcome.reason = reason
+						outcome.depth = depth
+						outcome.decoder = decoder.Type().String()
+						break decode
+					}
 				}
 
 				chunkCopy := *chunk
@@ -909,9 +1016,13 @@ func iterativeDecode(chunk *sources.Chunk, allDecoders []decoders.Decoder, maxDe
 				}
 
 				results = append(results, decoded)
+				if !isPlain {
+					run.addRetained(int64(len(decoded.Data)))
+					outcome.variants++
+				}
 
 				if depth+1 < maxDepth &&
-					decoder.Type() != detectorspb.DecoderType_PLAIN &&
+					!isPlain &&
 					!bytes.Equal(decoded.Data, data) &&
 					!slices.ContainsFunc(seen, func(s []byte) bool { return bytes.Equal(s, decoded.Data) }) {
 
@@ -927,7 +1038,34 @@ func iterativeDecode(chunk *sources.Chunk, allDecoders []decoders.Decoder, maxDe
 		currentInputs = nextInputs
 	}
 
-	return results
+	outcome.retainedBytes = run.retainedBytes()
+	if outcome.abandoned {
+		kept := results[:0]
+		for _, d := range results {
+			if d.DecoderType == detectorspb.DecoderType_PLAIN {
+				kept = append(kept, d)
+			}
+		}
+		results = kept
+	}
+
+	return results, outcome
+}
+
+// decodeStopReason reports whether decoding must stop before the next decoder
+// call, and the abandon reason. An empty reason means the scan itself was
+// cancelled, which is not accounted as abandoned work.
+func decodeStopReason(ctx context.Context, run *decodeRun, budget, nextBytes int64) (bool, string) {
+	if ctx.Err() != nil {
+		if errors.Is(context.Cause(ctx), errDecodeShed) {
+			return true, abandonReasonShed
+		}
+		return true, ""
+	}
+	if budget > 0 && run.retainedBytes()+nextBytes > budget {
+		return true, abandonReasonBudget
+	}
+	return false, ""
 }
 
 func (e *Engine) scannerWorker(ctx context.Context) {
@@ -935,63 +1073,75 @@ func (e *Engine) scannerWorker(ctx context.Context) {
 	var wgVerificationOverlap sync.WaitGroup
 
 	for chunk := range e.ChunksChan() {
-		startTime := time.Now()
-		sourceVerify := chunk.SourceVerify
-		sourceTypeStr := chunk.SourceType.String()
-		chunksEnteredStage.WithLabelValues("scanner", sourceTypeStr).Inc()
-
-		chunk.OriginalData = chunk.Data
-		decoded := iterativeDecode(chunk, e.decoders, e.maxDecodeDepth)
-
-		for _, d := range decoded {
-			matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(d.Data)
-			if len(matchingDetectors) == 0 {
-				chunksDropped.WithLabelValues("scanner", "no_matching_detectors", sourceTypeStr).Inc()
-				continue
-			}
-			if len(matchingDetectors) > 1 && !e.verificationOverlap {
-				wgVerificationOverlap.Add(1)
-				e.verificationOverlapChunksChan <- verificationOverlapChunk{
-					chunk:                       *d.Chunk,
-					detectors:                   matchingDetectors,
-					decoder:                     d.DecoderType,
-					verificationOverlapWgDoneFn: wgVerificationOverlap.Done,
-				}
-				continue
-			}
-
-			for _, detector := range matchingDetectors {
-				wgDetect.Add(1)
-				e.detectableChunksChan <- detectableChunk{
-					chunk:    *d.Chunk,
-					detector: detector,
-					decoder:  d.DecoderType,
-					verify:   e.shouldVerifyChunk(sourceVerify, detector, e.detectorVerificationOverrides),
-					wgDoneFn: wgDetect.Done,
-				}
-			}
-		}
-
-		dataSize := float64(len(chunk.Data))
-
-		scanBytesPerChunk.WithLabelValues(chunk.SourceType.String()).Observe(dataSize)
-		jobBytesScanned.WithLabelValues(
-			chunk.SourceType.String(),
-			chunk.SourceName,
-		).Add(dataSize)
-		chunksScannedLatency.Observe(float64(time.Since(startTime).Microseconds()))
-		jobChunksScanned.WithLabelValues(
-			chunk.SourceType.String(),
-			chunk.SourceName,
-		).Inc()
-
-		atomic.AddUint64(&e.metrics.ChunksScanned, 1)
-		atomic.AddUint64(&e.metrics.BytesScanned, uint64(dataSize))
+		runQueued(ctx, e.scannerQueue, chunk, func() {}, func() {
+			e.scanChunk(ctx, chunk, &wgDetect, &wgVerificationOverlap)
+		})
 	}
 
 	wgVerificationOverlap.Wait()
 	wgDetect.Wait()
 	ctx.Logger().V(4).Info("finished scanning chunks")
+}
+
+// scanChunk decodes one chunk and hands the results to the detector and verification-overlap stages.
+func (e *Engine) scanChunk(ctx context.Context, chunk *sources.Chunk, wgDetect, wgVerificationOverlap *sync.WaitGroup) {
+	startTime := time.Now()
+	sourceVerify := chunk.SourceVerify
+	sourceTypeStr := chunk.SourceType.String()
+	chunksEnteredStage.WithLabelValues("scanner", sourceTypeStr).Inc()
+
+	chunk.OriginalData = chunk.Data
+	decodeCtx, run, endDecode := e.stageWork.begin(ctx)
+	decoded, outcome := iterativeDecode(decodeCtx, run, e.maxDecodedBytesPerChunk, chunk, e.decoders, e.maxDecodeDepth)
+	endDecode()
+	if outcome.abandoned {
+		e.recordAbandonedDecode(ctx, chunk, outcome)
+	}
+
+	for _, d := range decoded {
+		matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(d.Data)
+		if len(matchingDetectors) == 0 {
+			chunksDropped.WithLabelValues("scanner", "no_matching_detectors", sourceTypeStr).Inc()
+			continue
+		}
+		if len(matchingDetectors) > 1 && !e.verificationOverlap {
+			wgVerificationOverlap.Add(1)
+			e.verificationOverlapChunksChan <- verificationOverlapChunk{
+				chunk:                       *d.Chunk,
+				detectors:                   matchingDetectors,
+				decoder:                     d.DecoderType,
+				verificationOverlapWgDoneFn: wgVerificationOverlap.Done,
+			}
+			continue
+		}
+
+		for _, detector := range matchingDetectors {
+			wgDetect.Add(1)
+			e.detectableChunksChan <- detectableChunk{
+				chunk:    *d.Chunk,
+				detector: detector,
+				decoder:  d.DecoderType,
+				verify:   e.shouldVerifyChunk(sourceVerify, detector, e.detectorVerificationOverrides),
+				wgDoneFn: wgDetect.Done,
+			}
+		}
+	}
+
+	dataSize := float64(len(chunk.Data))
+
+	scanBytesPerChunk.WithLabelValues(chunk.SourceType.String()).Observe(dataSize)
+	jobBytesScanned.WithLabelValues(
+		chunk.SourceType.String(),
+		chunk.SourceName,
+	).Add(dataSize)
+	chunksScannedLatency.Observe(float64(time.Since(startTime).Microseconds()))
+	jobChunksScanned.WithLabelValues(
+		chunk.SourceType.String(),
+		chunk.SourceName,
+	).Inc()
+
+	atomic.AddUint64(&e.metrics.ChunksScanned, 1)
+	atomic.AddUint64(&e.metrics.BytesScanned, uint64(dataSize))
 }
 
 func (e *Engine) shouldVerifyChunk(
@@ -1079,7 +1229,10 @@ func (e *Engine) verificationOverlapWorker(ctx context.Context) {
 	var wgDetect sync.WaitGroup
 
 	for chunk := range e.verificationOverlapChunksChan {
-		e.processVerificationOverlapChunk(ctx, chunk, &wgDetect)
+		chunk := chunk
+		runQueued(ctx, e.verificationQueue, chunk, chunk.verificationOverlapWgDoneFn, func() {
+			e.processVerificationOverlapChunk(ctx, chunk, &wgDetect)
+		})
 	}
 
 	wgDetect.Wait()
@@ -1207,11 +1360,43 @@ func fromDataWithoutVerifyRecoveringPanic(
 	return d.FromData(ctx, false, data)
 }
 
+// runQueued gates one unit of work through q. A nil queue runs process directly.
+// Every item reaches exactly one terminal state and is acknowledged and released
+// once. onNotAdmitted runs instead of process when admission is cancelled.
+func runQueued[T any](ctx context.Context, q *workqueue.Queue[T], value T, onNotAdmitted func(), process func()) {
+	if q == nil {
+		process()
+		return
+	}
+	handle := q.Enqueue(workqueue.Item[T]{ID: common.RandomID(5), Value: value})
+	if err := handle.Admit(ctx); err != nil {
+		handle.Acknowledge()
+		handle.Release()
+		onNotAdmitted()
+		return
+	}
+	if !handle.Start() {
+		handle.Drop()
+		handle.Acknowledge()
+		handle.Release()
+		onNotAdmitted()
+		return
+	}
+	defer handle.Release()
+	defer handle.Acknowledge()
+	defer handle.Complete()
+	process()
+}
+
 func (e *Engine) detectorWorker(ctx context.Context) {
 	for data := range e.detectableChunksChan {
-		start := time.Now()
-		e.detectChunk(ctx, data)
-		chunksDetectedLatency.Observe(float64(time.Since(start).Milliseconds()))
+		data := data
+		runQueued(ctx, e.detectorQueue, data, data.wgDoneFn, func() {
+			defer data.wgDoneFn()
+			start := time.Now()
+			e.detectChunk(ctx, data)
+			chunksDetectedLatency.Observe(float64(time.Since(start).Milliseconds()))
+		})
 	}
 }
 
@@ -1357,7 +1542,6 @@ func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
 
 	ctx.Logger().V(5).Info("Finished detecting chunk")
 
-	data.wgDoneFn()
 }
 
 func (e *Engine) filterResults(
@@ -1467,78 +1651,87 @@ func dedupeKey(result detectors.ResultWithMetadata) string {
 
 func (e *Engine) notifierWorker(ctx context.Context) {
 	for result := range e.ResultsChan() {
-		startTime := time.Now()
-		detectorNameStr := result.DetectorType.String()
-		// Filter unwanted results, based on `--results`.
-		if !result.Verified {
-			if result.IsWordlistFalsePositive && !e.retainFalsePositives {
-				// Skip false positives
-				resultsDropped.WithLabelValues("notifier", "wordlist_false_positive", detectorNameStr).Inc()
-				continue
-			} else if result.VerificationError() != nil {
-				if !e.notifyUnknownResults {
-					// Skip results with verification errors.
-					resultsDropped.WithLabelValues("notifier", "unknown_result_filtered", detectorNameStr).Inc()
-					continue
-				}
-			} else if !e.notifyUnverifiedResults {
-				// Skip unverified results.
-				resultsDropped.WithLabelValues("notifier", "unverified_result_filtered", detectorNameStr).Inc()
-				continue
-			}
-		} else if !e.notifyVerifiedResults {
-			// Skip verified results.
-			// TODO: Is this a legitimate use case?
-			resultsDropped.WithLabelValues("notifier", "verified_result_filtered", detectorNameStr).Inc()
-			continue
-		}
-		atomic.AddUint32(&e.numFoundResults, 1)
-
-		// Dedupe results by comparing the job, detector type, raw result, and source metadata.
-		// The key includes SourceMetadata (file path, line numbers, etc.) so genuinely
-		// different occurrences of the same credential at different locations are not
-		// suppressed. Only exact duplicates — same credential at the same location — are
-		// filtered, which handles peek-overlap re-scans and cross-decoder duplicates alike.
-		// The key also include the DetectorName to prevent deduping the results for
-		// custom detectors which have the same type.
-		//
-		// The key includes the JobID on purpose: dedupe is scoped to a single job. Each job
-		// is expected to report every secret it finds, even when an earlier job in the same
-		// engine run (a long-running engine re-scanning a target, or a CLI run whose sources
-		// overlap) already reported the same secret at the same location. Without the JobID
-		// a later job's finding would be silently dropped until the cache evicted the entry.
-		// See dedupeKey for how the fields are encoded. MD5 hash of the key is used to
-		// reduce memory usage of the dedupe cache, since the raw result and source
-		// metadata can be large.
-		//
-		// This deduplication only applies to results that are *not*
-		// from reverification, since we are expected to see the same
-		// result from reverification and want to Dispatch it below.
-
-		// Notifier workers share this cache; the check and insert must be one atomic step.
-		if e.dedupeCacheEnabled() && result.SecretID == 0 {
-			key := dedupeKey(result)
-			if found, _ := e.dedupeCache.ContainsOrAdd(key, struct{}{}); found {
-				resultsDropped.WithLabelValues("notifier", "dedupe_cache_hit", detectorNameStr).Inc()
-				continue
-			}
-		}
-
-		if result.Verified {
-			atomic.AddUint64(&e.metrics.VerifiedSecretsFound, 1)
-		} else {
-			atomic.AddUint64(&e.metrics.UnverifiedSecretsFound, 1)
-		}
-
-		if err := e.dispatcher.Dispatch(ctx, result); err != nil {
-			ctx.Logger().Error(err, "error notifying result")
-			resultsDispatched.WithLabelValues(detectorNameStr, strconv.FormatBool(result.Verified), "false").Inc()
-		} else {
-			resultsDispatched.WithLabelValues(detectorNameStr, strconv.FormatBool(result.Verified), "true").Inc()
-		}
-
-		chunksNotifiedLatency.Observe(float64(time.Since(startTime).Milliseconds()))
+		result := result
+		// If admission is cancelled, still notify: findings must not be lost at shutdown.
+		runQueued(ctx, e.notifierQueue, result,
+			func() { e.notifyResult(ctx, result) },
+			func() { e.notifyResult(ctx, result) },
+		)
 	}
+}
+
+func (e *Engine) notifyResult(ctx context.Context, result detectors.ResultWithMetadata) {
+	detectorNameStr := result.DetectorType.String()
+	startTime := time.Now()
+	// Filter unwanted results, based on `--results`.
+	if !result.Verified {
+		if result.IsWordlistFalsePositive && !e.retainFalsePositives {
+			// Skip false positives
+			resultsDropped.WithLabelValues("notifier", "wordlist_false_positive", detectorNameStr).Inc()
+			return
+		} else if result.VerificationError() != nil {
+			if !e.notifyUnknownResults {
+				// Skip results with verification errors.
+				resultsDropped.WithLabelValues("notifier", "unknown_result_filtered", detectorNameStr).Inc()
+				return
+			}
+		} else if !e.notifyUnverifiedResults {
+			// Skip unverified results.
+			resultsDropped.WithLabelValues("notifier", "unverified_result_filtered", detectorNameStr).Inc()
+			return
+		}
+	} else if !e.notifyVerifiedResults {
+		// Skip verified results.
+		// TODO: Is this a legitimate use case?
+		resultsDropped.WithLabelValues("notifier", "verified_result_filtered", detectorNameStr).Inc()
+		return
+	}
+	atomic.AddUint32(&e.numFoundResults, 1)
+
+	// Dedupe results by comparing the job, detector type, raw result, and source metadata.
+	// The key includes SourceMetadata (file path, line numbers, etc.) so genuinely
+	// different occurrences of the same credential at different locations are not
+	// suppressed. Only exact duplicates — same credential at the same location — are
+	// filtered, which handles peek-overlap re-scans and cross-decoder duplicates alike.
+	// The key also include the DetectorName to prevent deduping the results for
+	// custom detectors which have the same type.
+	//
+	// The key includes the JobID on purpose: dedupe is scoped to a single job. Each job
+	// is expected to report every secret it finds, even when an earlier job in the same
+	// engine run (a long-running engine re-scanning a target, or a CLI run whose sources
+	// overlap) already reported the same secret at the same location. Without the JobID
+	// a later job's finding would be silently dropped until the cache evicted the entry.
+	// See dedupeKey for how the fields are encoded. MD5 hash of the key is used to
+	// reduce memory usage of the dedupe cache, since the raw result and source
+	// metadata can be large.
+	//
+	// This deduplication only applies to results that are *not*
+	// from reverification, since we are expected to see the same
+	// result from reverification and want to Dispatch it below.
+
+	// Notifier workers share this cache; the check and insert must be one atomic step.
+	if e.dedupeCacheEnabled() && result.SecretID == 0 {
+		key := dedupeKey(result)
+		if found, _ := e.dedupeCache.ContainsOrAdd(key, struct{}{}); found {
+			resultsDropped.WithLabelValues("notifier", "dedupe_cache_hit", detectorNameStr).Inc()
+			return
+		}
+	}
+
+	if result.Verified {
+		atomic.AddUint64(&e.metrics.VerifiedSecretsFound, 1)
+	} else {
+		atomic.AddUint64(&e.metrics.UnverifiedSecretsFound, 1)
+	}
+
+	if err := e.dispatcher.Dispatch(ctx, result); err != nil {
+		ctx.Logger().Error(err, "error notifying result")
+		resultsDispatched.WithLabelValues(detectorNameStr, strconv.FormatBool(result.Verified), "false").Inc()
+	} else {
+		resultsDispatched.WithLabelValues(detectorNameStr, strconv.FormatBool(result.Verified), "true").Inc()
+	}
+
+	chunksNotifiedLatency.Observe(float64(time.Since(startTime).Milliseconds()))
 }
 
 // SupportsLineNumbers determines if a line number can be found for a source type.

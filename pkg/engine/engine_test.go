@@ -606,6 +606,8 @@ func BenchmarkSupportsLineNumbersLoop(b *testing.B) {
 
 // TestEngine_DuplicateSecrets is a test that detects ALL duplicate secrets with the same decoder.
 func TestEngine_DuplicateSecrets(t *testing.T) {
+	stopWatchdog := failAfter(t, 20*time.Second)
+	defer stopWatchdog()
 	ctx := context.Background()
 
 	absPath, err := filepath.Abs("./testdata/secrets.txt")
@@ -2253,7 +2255,9 @@ func TestEngine_VerificationOverlapWorker_DetectableChunkHasCorrectVerifyFlag(t 
 		// Arrange: Set up a fake detectableChunk processor so that any chunks (incorrectly) sent to
 		// e.detectableChunksChan don't block the test.
 		processedDetectableChunks := make(chan detectableChunk, 2)
+		processorDone := make(chan struct{})
 		go func() {
+			defer close(processorDone)
 			for chunk := range e.detectableChunksChan {
 				chunk.wgDoneFn()
 				processedDetectableChunks <- chunk
@@ -2286,6 +2290,7 @@ func TestEngine_VerificationOverlapWorker_DetectableChunkHasCorrectVerifyFlag(t 
 		e.verificationOverlapWorker(ctx)
 		close(e.results)
 		close(e.detectableChunksChan)
+		<-processorDone
 		close(processedDetectableChunks)
 
 		// Assert: Confirm that every generated result is unverified (because overlap detection precluded it), keeps the
@@ -2320,7 +2325,9 @@ func TestEngine_VerificationOverlapWorker_DetectableChunkHasCorrectVerifyFlag(t 
 		// Arrange: Set up a fake detectableChunk processor so that any chunks sent to e.detectableChunksChan don't
 		// block the test.
 		processedDetectableChunks := make(chan detectableChunk, 2)
+		processorDone := make(chan struct{})
 		go func() {
+			defer close(processorDone)
 			for chunk := range e.detectableChunksChan {
 				chunk.wgDoneFn()
 				processedDetectableChunks <- chunk
@@ -2352,6 +2359,7 @@ func TestEngine_VerificationOverlapWorker_DetectableChunkHasCorrectVerifyFlag(t 
 		// Act
 		e.verificationOverlapWorker(ctx)
 		close(e.detectableChunksChan)
+		<-processorDone
 		close(processedDetectableChunks)
 
 		// Assert: Confirm that SourceVerify flags are unchanged, and verify flags are correctly set.

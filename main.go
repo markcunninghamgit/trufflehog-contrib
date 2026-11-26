@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/fatih/color"
@@ -36,6 +37,7 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/handlers"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/log"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/output"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/resourcecontrol"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/sources"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/tui"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/updater"
@@ -302,6 +304,24 @@ var (
 	usingTUI   = false
 )
 
+var (
+	runtimeMetricsInterval     = cli.Flag("runtime-metrics-interval", "Write Go runtime memory and process metrics to the log at this interval; opt-in.").Default("0s").Duration()
+	maxDecodedBytesPerChunk    = cli.Flag("max-decoded-bytes-per-chunk", "Abandon a chunk's decoded variants once they exceed this size; the original chunk is still scanned. 0 disables the limit; opt-in.").Default("0").Bytes()
+	adaptiveConcurrency        = cli.Flag("adaptive-concurrency", "Adapt source concurrency using resource-pressure signals").Bool()
+	adaptiveShedUnits          = cli.Flag("adaptive-shed-units", "Under critical pressure, cancel running source units beyond the adaptive limit and requeue them; requires --adaptive-concurrency.").Bool()
+	heapProfileDir             = cli.Flag("heap-profile-dir", "Write heap and goroutine profiles to this directory under elevated or critical adaptive pressure; requires --adaptive-concurrency.").String()
+	heapProfileInterval        = cli.Flag("heap-profile-interval", "Minimum time between profile dumps at the same pressure level.").Default("2m").Duration()
+	heapProfileMax             = cli.Flag("heap-profile-max", "Maximum number of profile dumps per run; 0 is unlimited.").Default("50").Int()
+	unitRetries                = cli.Flag("unit-retries", "Retry failed source units before they emit chunks; opt-in.").Default("0").Int()
+	adaptiveHeapElevated       = cli.Flag("adaptive-heap-elevated", "Go heap size that triggers elevated adaptive pressure.").Default("2GB").Bytes()
+	adaptiveHeapCritical       = cli.Flag("adaptive-heap-critical", "Go heap size that triggers critical adaptive pressure.").Default("4GB").Bytes()
+	adaptiveGoroutinesElevated = cli.Flag("adaptive-goroutines-elevated", "Goroutine count that triggers elevated adaptive pressure.").Default("5000").Int()
+	adaptiveGoroutinesCritical = cli.Flag("adaptive-goroutines-critical", "Goroutine count that triggers critical adaptive pressure.").Default("15000").Int()
+	adaptiveCPUHigh            = cli.Flag("adaptive-cpu-high", "System CPU percent at or above which samples count as hot; sustained hot samples lower the limit and hot or warm CPU blocks raising it. 0 disables the CPU signal; requires --adaptive-concurrency.").Default("0").Float64()
+	adaptiveCPULow             = cli.Flag("adaptive-cpu-low", "System CPU percent at or below which the limit may be raised again; 0 means --adaptive-cpu-high minus 20.").Default("0").Float64()
+	adaptiveCPUHotSamples      = cli.Flag("adaptive-cpu-hot-samples", "Consecutive hot CPU samples (one per 5s) needed to lower the limit.").Default("3").Int()
+)
+
 // expandTilde replaces a leading ~ in each argument with the user's home
 // directory. This compensates for bypassing the shell (which would normally
 // perform this expansion) while still avoiding shell metacharacter injection.
@@ -463,7 +483,18 @@ func run(state overseer.State, logSync func() error) {
 	}()
 
 	logger := ctx.Logger()
-	logFatal := logFatalFunc(logger, logSync)
+	logFatalBase := logFatalFunc(logger, logSync)
+	var shutdownOnce sync.Once
+	emitShutdown := func(reason string, complete bool) {
+		shutdownOnce.Do(func() {
+			logger.Info("parent shutdown", "role", "parent", "reason", reason, "scan_complete", complete)
+		})
+	}
+	defer emitShutdown("error", false)
+	logFatal := func(err error, message string, keyAndVals ...any) {
+		emitShutdown("error", false)
+		logFatalBase(err, message, keyAndVals...)
+	}
 
 	// --debug and --trace still work the same, but in a future release --debug
 	// takes over --trace's level 5 and --trace goes away. Warn users now.
@@ -479,6 +510,7 @@ func run(state overseer.State, logSync func() error) {
 	go func() {
 		<-killSignal
 		logger.Info("Received signal, shutting down.")
+		emitShutdown("signal", false)
 		cancel(fmt.Errorf("canceling context due to signal"))
 
 		if err := cleantemp.CleanTempArtifacts(ctx); err != nil {
@@ -506,6 +538,26 @@ func run(state overseer.State, logSync func() error) {
 	// When setting a base commit, chunks must be scanned in order.
 	if *gitScanSinceCommit != "" {
 		*concurrency = 1
+	}
+
+	initialConcurrency := *concurrency
+	if *adaptiveConcurrency {
+		initialConcurrency = max(1, *concurrency/2)
+	}
+	logger.Info("parent startup",
+		"role", "parent",
+		"pid", os.Getpid(),
+		"ppid", os.Getppid(),
+		"executable", os.Args[0],
+		"platform", runtime.GOOS,
+		"logical_cpu_count", runtime.NumCPU(),
+		"initial_concurrency", initialConcurrency,
+		"current_concurrency", initialConcurrency,
+		"max_concurrency", *concurrency,
+		"adaptive_mode", *adaptiveConcurrency,
+	)
+	if *runtimeMetricsInterval > 0 {
+		go logRuntimeMetrics(ctx, logger, *runtimeMetricsInterval)
 	}
 
 	if *profile {
@@ -688,6 +740,7 @@ func run(state overseer.State, logSync func() error) {
 		PrintAvgDetectorTime:     *printAvgDetectorTime,
 		ShouldScanEntireChunk:    *scanEntireChunk,
 		MaxDecodeDepth:           *maxDecodeDepth,
+		MaxDecodedBytesPerChunk:  int64(*maxDecodedBytesPerChunk),
 		VerificationCacheMetrics: &verificationCacheMetrics,
 		DedupeCacheSize:          *dedupeCacheSize,
 	}
@@ -754,8 +807,25 @@ func run(state overseer.State, logSync func() error) {
 
 	if metrics.hasFoundResults && *fail {
 		logger.V(2).Info("exiting with code 183 because results were found")
+		emitShutdown("normal", true)
 		syncLogs(logSync)
 		os.Exit(183)
+	}
+	emitShutdown("normal", true)
+}
+
+func logRuntimeMetrics(ctx context.Context, logger logr.Logger, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			logger.V(3).Info("runtime metrics", "role", "parent", "event", "runtime_metrics", "pid", os.Getpid(), "ppid", os.Getppid(), "executable", os.Args[0], "heap_alloc", mem.HeapAlloc, "heap_sys", mem.HeapSys, "heap_inuse", mem.HeapInuse, "heap_idle", mem.HeapIdle, "stack_inuse", mem.StackInuse, "mallocs", mem.Mallocs, "frees", mem.Frees, "gc_cycles", mem.NumGC, "goroutines", runtime.NumGoroutine())
+		}
 	}
 }
 
@@ -855,7 +925,13 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 		sources.WithConcurrentUnits(cfg.Concurrency),
 		sources.WithSourceUnits(),
 		sources.WithBufferedOutput(defaultOutputBufferSize),
+		sources.WithUnitRetries(*unitRetries),
+		sources.WithStatsHook(func(stats sources.SourceManagerStats) {
+			ctx.Logger().V(3).Info("source-manager lifecycle", "role", "source-manager", "started", stats.Started, "completed", stats.Completed, "errors", stats.Errors, "active", stats.Active, "limit", stats.Limit)
+		}),
 	}
+
+	cfg.SourceManager = sources.NewManager(opts...)
 
 	if jobReportWriter != nil {
 		unitHook, finishedMetrics := sources.NewUnitHook(ctx)
@@ -863,13 +939,51 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 		handleFinishedMetrics(ctx, finishedMetrics, jobReportWriter)
 	}
 
-	cfg.SourceManager = sources.NewManager(opts...)
-
 	eng, err := engine.NewEngine(ctx, &cfg)
 	if err != nil {
 		return scanMetrics, fmt.Errorf("error initializing engine: %v", err)
 	}
 	eng.Start(ctx)
+	if *adaptiveConcurrency {
+		heapDumper := &resourcecontrol.HeapProfileDumper{
+			Dir:         *heapProfileDir,
+			MinInterval: *heapProfileInterval,
+			MaxDumps:    *heapProfileMax,
+			Logf:        func(msg string, kv ...any) { ctx.Logger().Info(msg, kv...) },
+		}
+		controller := resourcecontrol.NewController(resourcecontrol.Config{
+			Provider: resourcecontrol.NewProvider(resourcecontrol.ProviderConfig{
+				Runtime: resourcecontrol.RuntimeProvider{
+					ElevatedHeapBytes:  uint64(*adaptiveHeapElevated),
+					CriticalHeapBytes:  uint64(*adaptiveHeapCritical),
+					ElevatedGoroutines: *adaptiveGoroutinesElevated,
+					CriticalGoroutines: *adaptiveGoroutinesCritical,
+				},
+			}),
+			Maximum:        *concurrency,
+			Initial:        max(1, *concurrency/2),
+			Interval:       time.Second,
+			CPU:            resourcecontrol.SystemCPUSampler{},
+			CPUHighPercent: *adaptiveCPUHigh,
+			CPULowPercent:  *adaptiveCPULow,
+			CPUHotSamples:  *adaptiveCPUHotSamples,
+			SetLimit: func(limit int) {
+				ctx.Logger().Info("resource controller changed stage admission limit", "limit", limit)
+				cfg.SourceManager.SetMaxConcurrentSources(limit)
+				cfg.SourceManager.SetMaxConcurrentUnits(limit)
+				eng.SetMaxConcurrentStages(limit)
+			},
+			OnDecision: func(decision resourcecontrol.Decision) {
+				heapDumper.MaybeDump(decision.Snapshot.Level, decision.Snapshot.Reason)
+				if *adaptiveShedUnits && decision.Snapshot.Level == resourcecontrol.PressureCritical {
+					cfg.SourceManager.ShedExcessUnits(decision.Current)
+					eng.ShedStageWork(decision.Current)
+				}
+				ctx.Logger().V(3).Info("resource controller sample", "role", "resource-controller", "event", "resource_controller_sample", "pid", os.Getpid(), "ppid", os.Getppid(), "previous", decision.Previous, "current", decision.Current, "maximum", decision.Maximum, "pressure", decision.Snapshot.Level, "reason", decision.Snapshot.Reason, "scale_action", decision.ScaleAction, "cooldown_remaining", decision.CooldownRemaining.String(), "scale_eligible", decision.ScaleEligible, "cpu_percent", decision.CPUPercent, "cpu_state", decision.CPUState)
+			},
+		})
+		go controller.Start(ctx)
+	}
 
 	persistGitRepo := *gitNoCleanup || *githubNoCleanup || *gitlabNoCleanup
 	gitCloneTempPath := ""
@@ -1324,7 +1438,27 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 		printAverageDetectorTime(eng)
 	}
 
-	return metrics{Metrics: eng.GetMetrics(), hasFoundResults: eng.HasFoundResults()}, retErr
+	finalMetrics := eng.GetMetrics()
+	managerStats := cfg.SourceManager.Stats()
+	ctx.Logger().Info("scan final accounting",
+		"role", "parent",
+		"event", "scan_final_accounting",
+		"discovered", managerStats.Discovered,
+		"assigned", managerStats.Assigned,
+		"completed", managerStats.UnitDone,
+		"cancelled", managerStats.Cancelled,
+		"retried", managerStats.Retries,
+		"skipped", managerStats.Skipped,
+		"failed", managerStats.Failed,
+		"in_flight", managerStats.Active,
+		"chunks", finalMetrics.ChunksScanned,
+		"abandoned_decodes", finalMetrics.AbandonedDecodes,
+		"abandoned_decode_bytes", finalMetrics.AbandonedDecodeBytes,
+		"complete", finalMetrics.AbandonedDecodes == 0,
+		"findings", finalMetrics.VerifiedSecretsFound+finalMetrics.UnverifiedSecretsFound,
+	)
+
+	return metrics{Metrics: finalMetrics, hasFoundResults: eng.HasFoundResults()}, retErr
 }
 
 // parseResults ensures that users provide valid CSV input to `--results`.
