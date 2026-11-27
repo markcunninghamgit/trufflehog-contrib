@@ -85,7 +85,9 @@ func TestUnitAdmissionCancelledWhileWaiting(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- mgr.Wait() }()
 	select {
-	case <-done:
+	case err := <-done:
+		// Wait returns the interrupt error after cancellation; only completion matters here.
+		t.Logf("manager wait returned: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Wait did not return after cancellation while units were waiting for admission")
 	}

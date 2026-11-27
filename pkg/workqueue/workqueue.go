@@ -165,12 +165,13 @@ func (h *Handle[T]) finish(state State) bool {
 	if h.entry.state != Active && h.entry.state != Admitted && h.entry.state != Queued {
 		return false
 	}
-	if h.entry.state == Queued {
+	switch h.entry.state {
+	case Queued:
 		q.counts.Queued--
 		q.items = removeEntry(q.items, h.entry)
-	} else if h.entry.state == Admitted {
+	case Admitted:
 		q.counts.Admitted--
-	} else {
+	default:
 		q.counts.Active--
 		q.active--
 	}

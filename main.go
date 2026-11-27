@@ -931,13 +931,13 @@ func runSingleScan(ctx context.Context, cmd string, cfg engine.Config) (metrics,
 		}),
 	}
 
-	cfg.SourceManager = sources.NewManager(opts...)
-
 	if jobReportWriter != nil {
 		unitHook, finishedMetrics := sources.NewUnitHook(ctx)
 		opts = append(opts, sources.WithReportHook(unitHook))
 		handleFinishedMetrics(ctx, finishedMetrics, jobReportWriter)
 	}
+
+	cfg.SourceManager = sources.NewManager(opts...)
 
 	eng, err := engine.NewEngine(ctx, &cfg)
 	if err != nil {

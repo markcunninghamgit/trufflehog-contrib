@@ -2,7 +2,6 @@ package workqueue
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -19,7 +18,7 @@ func failAfter(t *testing.T, timeout time.Duration) func() {
 		case <-timer.C:
 			buf := make([]byte, 1<<20)
 			n := runtime.Stack(buf, true)
-			t.Errorf("test exceeded %s; goroutine dump:\n%s", timeout, fmt.Sprintf("%s", buf[:n]))
+			t.Errorf("test exceeded %s; goroutine dump:\n%s", timeout, string(buf[:n]))
 		case <-done:
 		}
 	}()

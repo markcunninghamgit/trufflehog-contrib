@@ -1229,7 +1229,6 @@ func (e *Engine) verificationOverlapWorker(ctx context.Context) {
 	var wgDetect sync.WaitGroup
 
 	for chunk := range e.verificationOverlapChunksChan {
-		chunk := chunk
 		runQueued(ctx, e.verificationQueue, chunk, chunk.verificationOverlapWgDoneFn, func() {
 			e.processVerificationOverlapChunk(ctx, chunk, &wgDetect)
 		})
@@ -1390,7 +1389,6 @@ func runQueued[T any](ctx context.Context, q *workqueue.Queue[T], value T, onNot
 
 func (e *Engine) detectorWorker(ctx context.Context) {
 	for data := range e.detectableChunksChan {
-		data := data
 		runQueued(ctx, e.detectorQueue, data, data.wgDoneFn, func() {
 			defer data.wgDoneFn()
 			start := time.Now()
@@ -1651,7 +1649,6 @@ func dedupeKey(result detectors.ResultWithMetadata) string {
 
 func (e *Engine) notifierWorker(ctx context.Context) {
 	for result := range e.ResultsChan() {
-		result := result
 		// If admission is cancelled, still notify: findings must not be lost at shutdown.
 		runQueued(ctx, e.notifierQueue, result,
 			func() { e.notifyResult(ctx, result) },

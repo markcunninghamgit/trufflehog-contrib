@@ -841,7 +841,7 @@ func (s *SourceManager) runWithUnits(ctx context.Context, source SourceUnitEnumC
 			report.ReportError(jobErr(ctx, err))
 			catchFirstError(jobErr(ctx, err))
 		}
-		ctx.Logger().Info("source enumeration finished", "role", "source-manager", "event", "source_enumeration_finished", "source_name", report.SourceName, "source_id", report.SourceID, "job_id", report.JobID, "source_type", ctx.Value("source_type"), "discovered_count", unitReporter.enumerationReporter.discovered.Load(), "queue_depth", len(unitReporter.unitCh))
+		ctx.Logger().Info("source enumeration finished", "role", "source-manager", "event", "source_enumeration_finished", "source_name", report.SourceName, "source_id", report.SourceID, "job_id", report.JobID, "source_type", ctx.Value("source_type"), "discovered_count", unitReporter.discovered.Load(), "queue_depth", len(unitReporter.unitCh))
 	}()
 	var wg sync.WaitGroup
 	unitSem, releaseUnitSem := s.newUnitSem()
