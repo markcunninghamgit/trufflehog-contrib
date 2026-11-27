@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -95,6 +96,19 @@ func (c errorChunker) Chunks(context.Context, chan *Chunk, ...ChunkingTarget) er
 func (c errorChunker) Enumerate(context.Context, UnitReporter) error                { return c.cb() }
 func (c errorChunker) ChunkUnit(context.Context, SourceUnit, ChunkReporter) error   { return c.cb() }
 
+type retryingChunker struct{ attempts atomic.Int32 }
+
+func (c *retryingChunker) Chunks(context.Context, chan *Chunk, ...ChunkingTarget) error { return nil }
+func (c *retryingChunker) Enumerate(ctx context.Context, reporter UnitReporter) error {
+	return reporter.UnitOk(ctx, CommonSourceUnit{ID: "retry"})
+}
+func (c *retryingChunker) ChunkUnit(ctx context.Context, _ SourceUnit, reporter ChunkReporter) error {
+	if c.attempts.Add(1) == 1 {
+		return errors.New("signal: killed")
+	}
+	return reporter.ChunkOk(ctx, Chunk{Data: []byte("retried")})
+}
+
 // buildDummy is a helper function to enroll a DummySource with a SourceManager.
 func buildDummy(chunkMethod chunker) (Source, error) {
 	source := &DummySource{chunker: chunkMethod}
@@ -132,6 +146,11 @@ func TestSourceManagerRun(t *testing.T) {
 		assert.Error(t, err)
 		assert.ErrorIs(t, ref.Err(), ErrJobDone)
 	}
+	stats := mgr.Stats()
+	assert.Equal(t, uint64(3), stats.Started)
+	assert.Equal(t, uint64(3), stats.Completed)
+	assert.Equal(t, uint64(0), stats.Errors)
+	assert.Equal(t, 0, stats.Active)
 }
 
 func TestSourceManagerWait(t *testing.T) {
@@ -309,6 +328,23 @@ func TestSourceManagerNonFatalError(t *testing.T) {
 	assert.Equal(t, 1, int(report.TotalChunks))
 	assert.Equal(t, 2, len(report.Errors))
 	assert.True(t, report.DoneEnumerating)
+}
+
+func TestSourceManagerRetriesZeroEmissionUnit(t *testing.T) {
+	chunker := &retryingChunker{}
+	mgr := NewManager(WithBufferedOutput(8), WithSourceUnits(), WithUnitRetries(1))
+	source, err := buildDummy(chunker)
+	assert.NoError(t, err)
+	ref, err := mgr.EnumerateAndScan(context.Background(), "dummy", source)
+	assert.NoError(t, err)
+	<-ref.Done()
+	chunk, err := tryRead(mgr.Chunks())
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("retried"), chunk.Data)
+	assert.Equal(t, int32(2), chunker.attempts.Load())
+	stats := mgr.Stats()
+	assert.Equal(t, uint64(1), stats.Retries)
+	assert.Equal(t, uint64(0), stats.Incomplete)
 }
 
 func TestSourceManagerContextCancelled(t *testing.T) {
